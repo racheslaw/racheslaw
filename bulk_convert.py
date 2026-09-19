@@ -290,6 +290,10 @@ def main(argv=None) -> int:
     if args.log_file:
         handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", handlers=handlers)
+    # pdfminer (used internally for PDF text extraction) logs benign warnings about
+    # malformed font metadata in some PDFs (e.g. "Could not get FontBBox..."); these
+    # don't affect extraction and only add noise, so keep pdfminer to errors only.
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
     if not args.source_dir.is_dir():
         log.error("source directory does not exist or is not a directory: %s", args.source_dir)
