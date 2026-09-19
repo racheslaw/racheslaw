@@ -28,17 +28,23 @@ import argparse
 import logging
 import shutil
 import sys
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pymupdf
 from markitdown import MarkItDown
-from PIL import Image, ImageSequence, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
 DOC_EXTENSIONS = {".docx", ".xlsx", ".pptx", ".pdf", ".eml", ".msg"}
+OOXML_EXTENSIONS = {".docx", ".xlsx", ".pptx"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff"}
 SUPPORTED_EXTENSIONS = DOC_EXTENSIONS | IMAGE_EXTENSIONS
 
 DEFAULT_MAX_FILE_SIZE_MB = 200
+MAX_PDF_PAGES = 500
+MAX_PDF_PAGE_POINTS = 5000  # ~69in; guards against a hostile oversized page
+PDF_OCR_DPI = 300
 
 log = logging.getLogger("bulk_convert")
 
@@ -76,10 +82,31 @@ def markdown_header(title: str, relative_source: Path, kind: str) -> str:
     )
 
 
+def is_blank(text: str) -> bool:
+    # markitdown occasionally returns the literal string "None" when an underlying
+    # converter (e.g. mammoth on a malformed .docx) fails internally without raising.
+    return text.strip().lower() in ("", "none")
+
+
 def convert_document(source_file: Path, converter: MarkItDown) -> str:
-    with open(source_file, "rb") as fh:
-        result = converter.convert_stream(fh, file_extension=source_file.suffix)
-    return result.text_content or ""
+    suffix = source_file.suffix.lower()
+    try:
+        with open(source_file, "rb") as fh:
+            result = converter.convert_stream(fh, file_extension=suffix)
+        return result.text_content or ""
+    except (KeyError, zipfile.BadZipFile) as exc:
+        if suffix in OOXML_EXTENSIONS:
+            raise ConversionError(
+                f"not a valid modern Office file ({exc}) - likely an old .doc/.xls/.ppt "
+                f"file saved with a .{suffix.lstrip('.')} extension, or a corrupted file; "
+                "re-save it from Word/Excel/PowerPoint (or export as PDF) and retry"
+            ) from exc
+        raise
+
+
+def preprocess_for_ocr(image: Image.Image) -> Image.Image:
+    gray = ImageOps.grayscale(image)
+    return ImageOps.autocontrast(gray)
 
 
 def ocr_image(source_file: Path, lang: str) -> str:
@@ -98,8 +125,26 @@ def ocr_image(source_file: Path, lang: str) -> str:
             frames = list(ImageSequence.Iterator(image)) if getattr(image, "n_frames", 1) > 1 else [image]
             pages = []
             for index, frame in enumerate(frames, start=1):
-                text = pytesseract.image_to_string(frame.convert("RGB"), lang=lang).strip()
+                text = pytesseract.image_to_string(preprocess_for_ocr(frame), lang=lang).strip()
                 pages.append(f"--- Page {index} ---\n\n{text}" if len(frames) > 1 else text)
+    return "\n\n".join(pages)
+
+
+def ocr_pdf(source_file: Path, lang: str) -> str:
+    import pytesseract
+
+    pages = []
+    with pymupdf.open(source_file) as doc:
+        if doc.page_count > MAX_PDF_PAGES:
+            raise ConversionError(f"PDF has {doc.page_count} pages, exceeds safety limit of {MAX_PDF_PAGES}")
+        for index, page in enumerate(doc, start=1):
+            if page.rect.width > MAX_PDF_PAGE_POINTS or page.rect.height > MAX_PDF_PAGE_POINTS:
+                pages.append(f"--- Page {index} ---\n\n*[page too large to OCR safely, skipped]*")
+                continue
+            pix = page.get_pixmap(dpi=PDF_OCR_DPI)
+            image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            text = pytesseract.image_to_string(preprocess_for_ocr(image), lang=lang).strip()
+            pages.append(f"--- Page {index} ---\n\n{text}" if doc.page_count > 1 else text)
     return "\n\n".join(pages)
 
 
@@ -109,17 +154,34 @@ def process_file(
     output_root: Path,
     converter: MarkItDown,
     lang: str,
-) -> None:
+) -> bool:
+    """Returns True if the output has no meaningful extracted text (still written, but flagged)."""
     relative = source_file.relative_to(source_root)
     suffix = source_file.suffix.lower()
 
     if suffix in DOC_EXTENSIONS:
         body = convert_document(source_file, converter)
-        header = markdown_header(source_file.name, relative, "document")
+        used_ocr_fallback = False
+        if suffix == ".pdf" and is_blank(body):
+            ocr_text = ocr_pdf(source_file, lang)
+            if not is_blank(ocr_text):
+                body = ocr_text
+                used_ocr_fallback = True
+        empty = is_blank(body)
+        kind = "document, OCR fallback" if used_ocr_fallback else "document"
+        header = markdown_header(source_file.name, relative, kind)
+        if empty:
+            note = "even after OCR " if used_ocr_fallback else ""
+            body = f"*No extractable text found {note}in this file.*\n"
     elif suffix in IMAGE_EXTENSIONS:
         body = ocr_image(source_file, lang)
+        empty = is_blank(body)
         header = markdown_header(source_file.name, relative, "OCR")
-        body = f"```text\n{body}\n```\n"
+        body = (
+            f"```text\n{body}\n```\n"
+            if not empty
+            else "*No extractable text found by OCR (image may contain no legible text).*\n"
+        )
     else:
         raise ConversionError(f"unsupported extension: {suffix}")
 
@@ -127,6 +189,7 @@ def process_file(
     output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     output_path.write_text(header + body, encoding="utf-8")
     output_path.chmod(0o600)
+    return empty
 
 
 def iter_candidate_files(source_root: Path, recursive: bool):
@@ -153,7 +216,7 @@ def run(source_dir: Path, output_dir: Path, recursive: bool, max_size_bytes: int
 
     converter = MarkItDown()  # no LLM client / API credentials: conversion stays local
 
-    converted, skipped, failed = 0, 0, []
+    converted, skipped, failed, empty_text = 0, 0, [], []
 
     for source_file in iter_candidate_files(source_root, recursive):
         relative = source_file.relative_to(source_root)
@@ -175,16 +238,30 @@ def run(source_dir: Path, output_dir: Path, recursive: bool, max_size_bytes: int
             continue
 
         try:
-            process_file(source_file, source_root, output_root, converter, lang)
-            log.info("converted: %s", relative)
+            was_empty = process_file(source_file, source_root, output_root, converter, lang)
+            if was_empty:
+                log.warning("no extractable text: %s", relative)
+                empty_text.append(str(relative))
+            else:
+                log.info("converted: %s", relative)
             converted += 1
         except Exception as exc:  # noqa: BLE001 - keep the batch going on any single-file failure
             log.error("FAILED: %s (%s: %s)", relative, type(exc).__name__, exc)
             failed.append(str(relative))
 
-    log.info("done: %d converted, %d skipped, %d failed", converted, skipped, len(failed))
+    log.info(
+        "done: %d converted (%d with no extractable text), %d skipped, %d failed",
+        converted,
+        len(empty_text),
+        skipped,
+        len(failed),
+    )
+    if empty_text:
+        log.info("files with no extractable text (likely scans/photos with no legible text - originals untouched):")
+        for name in empty_text:
+            log.info("  - %s", name)
     if failed:
-        log.info("files that could not be converted (originals left untouched):")
+        log.info("files that could not be converted at all (originals untouched):")
         for name in failed:
             log.info("  - %s", name)
     return 0 if not failed else 2
